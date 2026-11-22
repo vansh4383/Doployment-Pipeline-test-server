@@ -1,4 +1,4 @@
-# GoloBiz Backend – CI/CD Pipeline Automation
+# CI/CD Pipeline Automation
 
 Automated CI/CD pipelines for GoloBiz backend applications using **Jenkins, GitLab, PM2, Slack, and Email Notifications**.
 
