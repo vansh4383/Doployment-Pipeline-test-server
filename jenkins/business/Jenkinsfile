@@ -1,0 +1,223 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        APP = "pipeline-pro"
+        BASE = "/opt/pipeline-pro"
+        TEST_PORT = "4000"
+        PROD_PORT = "5001"
+        SMOKE_PATH = "/v1/health"
+        DEPLOY_ALLOWED = "false"
+        SLACK_WEBHOOK = credentials('slack-webhook')
+    }
+
+    stages {
+        stage("Validate Branch") {
+            steps {
+                script {
+                    def sourceBranch = env.gitlabSourceBranch ?:
+                                       env.gitlabBranch ?:
+                                       env.BRANCH_NAME ?: ""
+
+                    if (sourceBranch == "test/server") {
+                        env.DEPLOY_ALLOWED = "true"
+                        echo "Deployment allowed: ${sourceBranch}"
+                    } else {
+                        echo "Skipping deployment for branch: ${sourceBranch}"
+                        currentBuild.result = "NOT_BUILT"
+                    }
+                }
+            }
+        }
+
+        stage("Checkout Code") {
+            when {
+                expression { env.DEPLOY_ALLOWED == "true" }
+            }
+            steps {
+                git branch: 'test/server',
+                    credentialsId: 'access -token',
+                    url: 'https://gitlab.com/goloappdeveloper/golobiz-backend-business-owner-api.git'
+            }
+        }
+
+        stage("Install and Build") {
+            when {
+                expression { env.DEPLOY_ALLOWED == "true" }
+            }
+            steps {
+                sh '''
+                    set -e
+                    npm ci
+                    npm run build
+                    test -f dist/server.js
+                '''
+            }
+        }
+
+        stage("Prepare Release") {
+            when {
+                expression { env.DEPLOY_ALLOWED == "true" }
+            }
+            steps {
+                sh '''
+                    set -e
+
+                    RELEASE_DIR="$BASE/releases/$BUILD_NUMBER"
+
+                    test -f "$BASE/.env"
+
+                    mkdir -p "$BASE/releases"
+                    rm -rf "$RELEASE_DIR"
+                    mkdir -p "$RELEASE_DIR"
+
+                    cp -a dist package.json package-lock.json "$RELEASE_DIR/"
+                    cp "$BASE/.env" "$RELEASE_DIR/.env"
+
+                    cd "$RELEASE_DIR"
+                    npm ci --omit=dev
+                '''
+            }
+        }
+
+        stage("Candidate Deployment") {
+            when {
+                expression { env.DEPLOY_ALLOWED == "true" }
+            }
+            steps {
+                sh '''
+                    set -e
+
+                    RELEASE_DIR="$BASE/releases/$BUILD_NUMBER"
+
+                    pm2 delete "$APP-candidate" >/dev/null 2>&1 || true
+
+                    cd "$RELEASE_DIR"
+                    PORT="$TEST_PORT" pm2 start dist/server.js \
+                        --name "$APP-candidate" --update-env
+                '''
+            }
+        }
+
+        stage("Smoke Testing") {
+            when {
+                expression { env.DEPLOY_ALLOWED == "true" }
+            }
+            steps {
+                sh '''
+                    set -e
+
+                    for i in $(seq 1 30); do
+                        if curl -fsS "http://127.0.0.1:$TEST_PORT$SMOKE_PATH" >/dev/null; then
+                            echo "Business Owner API smoke test passed"
+                            exit 0
+                        fi
+                        sleep 2
+                    done
+
+                    echo "Business Owner API smoke test failed"
+                    exit 1
+                '''
+            }
+        }
+
+        stage("Production Deployment") {
+            when {
+                expression { env.DEPLOY_ALLOWED == "true" }
+            }
+            steps {
+                sh '''
+                    set -e
+
+                    RELEASE_DIR="$BASE/releases/$BUILD_NUMBER"
+                    PREVIOUS_RELEASE=""
+
+                    if [ -L "$BASE/current" ]; then
+                        PREVIOUS_RELEASE=$(readlink -f "$BASE/current")
+                    fi
+
+                    pm2 delete "$APP-candidate" >/dev/null 2>&1 || true
+                    pm2 delete "$APP" >/dev/null 2>&1 || true
+
+                    cd "$RELEASE_DIR"
+                    PORT="$PROD_PORT" pm2 start dist/server.js \
+                        --name "$APP" --update-env
+
+                    DEPLOY_OK=0
+
+                    for i in $(seq 1 30); do
+                        if curl -fsS "http://127.0.0.1:$PROD_PORT$SMOKE_PATH" >/dev/null; then
+                            DEPLOY_OK=1
+                            break
+                        fi
+                        sleep 2
+                    done
+
+                    if [ "$DEPLOY_OK" -ne 1 ]; then
+                        echo "Production check failed. Attempting rollback."
+
+                        pm2 delete "$APP" >/dev/null 2>&1 || true
+
+                        if [ -n "$PREVIOUS_RELEASE" ] && [ -f "$PREVIOUS_RELEASE/dist/server.js" ]; then
+                            cd "$PREVIOUS_RELEASE"
+                            PORT="$PROD_PORT" pm2 start dist/server.js \
+                                --name "$APP" --update-env
+                            pm2 save
+                        fi
+
+                        exit 1
+                    fi
+
+                    ln -sfn "$RELEASE_DIR" "$BASE/current"
+                    pm2 save
+
+                    echo "Business Owner API deployment completed"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.DEPLOY_ALLOWED == "true") {
+                    def msg = "SUCCESS: Business Owner API deployed. Build #${env.BUILD_NUMBER}"
+                    writeFile file: 'slack_payload.json',
+                        text: groovy.json.JsonOutput.toJson([text: msg])
+                    sh 'curl --fail --silent --show-error -X POST -H "Content-type: application/json" --data-binary @slack_payload.json "$SLACK_WEBHOOK"'
+
+                    emailext(
+                        to: 'alextest@gmail.com',
+                        subject: "Business Owner API Deployment SUCCESS - Build #${env.BUILD_NUMBER}",
+                        body: "Business Owner API deployment completed successfully.\nBuild: ${env.BUILD_URL}"
+                    )
+                }
+            }
+        }
+
+        failure {
+            script {
+                if (env.DEPLOY_ALLOWED == "true") {
+                    sh 'pm2 delete "$APP-candidate" >/dev/null 2>&1 || true'
+
+                    def msg = "FAILED: Business Owner API deployment. Build #${env.BUILD_NUMBER}"
+                    writeFile file: 'slack_payload.json',
+                        text: groovy.json.JsonOutput.toJson([text: msg])
+                    sh 'curl --fail --silent --show-error -X POST -H "Content-type: application/json" --data-binary @slack_payload.json "$SLACK_WEBHOOK"'
+
+                    emailext(
+                        to: 'alextest@gmail.com',
+                        subject: "Business Owner API Deployment FAILED - Build #${env.BUILD_NUMBER}",
+                        body: "Business Owner API deployment failed.\nCheck Jenkins logs: ${env.BUILD_URL}"
+                    )
+                }
+            }
+        }
+    }
+}
